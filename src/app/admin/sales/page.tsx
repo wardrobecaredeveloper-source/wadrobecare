@@ -43,7 +43,28 @@ export default async function AdminSalesPage({ searchParams }: { searchParams: S
   const now = new Date()
   const withEffectiveStatus = sales.map((s) => ({
     ...s,
-    effectiveStatus: effectiveStatus(s, now),
+    effectiveStatus: effectiveStatus({
+      id: s.id,
+      name: s.name,
+      kind: s.kind === 'CAMPAIGN' ? 'CAMPAIGN' : 'CLEARANCE',
+      status: s.status as any,
+      startsAt: s.startsAt?.toISOString() ?? null,
+      endsAt: s.endsAt?.toISOString() ?? null,
+      endedAt: s.endedAt?.toISOString() ?? null,
+      pct: s.defaultPct,
+      items: s.items.map((it: any) => ({ productId: it.productId, pct: it.pct, reasonId: it.reasonId, note: it.note ?? '', flawPhotoUrl: it.flawPhotoUrl })),
+      home: s.home,
+      pins: s.pins ? JSON.parse(s.pins) : [],
+      allowFlawOnHome: s.allowFlawOnHome,
+      countdown: s.countdown,
+      bundleSavingOnSale: s.bundleSavingOnSale,
+      blockPromoCodes: s.blockPromoCodes,
+      headline: s.headline ?? '',
+      strip: s.subheadline ?? '',
+      announcement: s.announcement ?? '',
+      createdBy: s.createdById ?? '',
+      revision: s.revision,
+    }, now),
     itemCount: s.items.length,
   }))
 

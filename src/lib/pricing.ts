@@ -1,8 +1,10 @@
 /**
  * Global Pricing Engine — the single source of truth for product prices.
  *
- * Determines the correct selling price for a product at the current moment,
- * accounting for active sales/campaigns, manually-set sale prices, and normal prices.
+ * Wraps the developer package's pricing logic (src/lib/deals/) with
+ * database integration. The developer package provides the pure
+ * functions (salePrice, currentPrice, repriceLine, inForce, etc.);
+ * this module fetches sales from the DB and caches them.
  *
  * Priority:
  *   1. Active campaign price (if product is in a live campaign)
@@ -14,6 +16,13 @@
  */
 
 import { db } from '@/lib/db'
+import { inForce, effectiveStatus, findConflicts } from '@/lib/deals/status'
+import { salePrice, itemPct, discountPercent } from '@/lib/deals/pricing'
+import { saleFor, currentPrice as dealCurrentPrice, repriceLine } from '@/lib/deals/reprice'
+import { DEFAULT_SETTINGS, type Sale, type SaleItem, type SaleProduct, type DealSettings } from '@/lib/deals/types'
+
+export { salePrice, itemPct, discountPercent, inForce, effectiveStatus, findConflicts, repriceLine, DEFAULT_SETTINGS }
+export type { Sale, SaleItem, SaleProduct, DealSettings }
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -269,27 +278,7 @@ export async function batchCurrentPrices(
 }
 
 // ─── Effective status ────────────────────────────────────────────────────────
-
-/**
- * Determine the effective status of a sale based on the current time.
- * A SCHEDULED sale becomes LIVE when its start time arrives.
- * A LIVE sale becomes ENDED when its end time passes.
- */
-export function effectiveStatus(
-  sale: { status: string; startsAt: Date; endsAt: Date | null; endedAt: Date | null },
-  now: Date = new Date(),
-): string {
-  if (sale.status === 'ENDED' || sale.endedAt) return 'ENDED'
-  if (sale.status === 'DRAFT' || sale.status === 'PENDING') return sale.status
-
-  const hasStarted = sale.startsAt <= now
-  const hasEnded = sale.endsAt ? sale.endsAt <= now : false
-
-  if (hasEnded) return 'ENDED'
-  if (hasStarted && !hasEnded) return 'LIVE'
-  if (!hasStarted) return 'SCHEDULED'
-  return sale.status
-}
+// effectiveStatus is now re-exported from src/lib/deals/status.ts (line 24)
 
 /**
  * Get the homepage campaign — the one ending soonest that is currently live
