@@ -111,7 +111,6 @@ const NAV_GROUPS: NavGroup[] = [
   {
     label: 'Marketing',
     items: [
-      { label: 'Sales & Campaigns', href: '/admin/sales', icon: Tag, permission: 'notification.view' },
       { label: 'Campaigns', href: '/admin/marketing', icon: Megaphone, permission: 'campaign.manage' },
       { label: 'Banners', href: '/admin/banners', icon: LayoutGrid, permission: 'banner.manage' },
       { label: 'FAQs', href: '/admin/faqs', icon: FileText, permission: 'faq.manage' },

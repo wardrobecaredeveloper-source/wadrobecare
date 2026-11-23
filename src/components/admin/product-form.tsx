@@ -799,24 +799,31 @@ export function ProductForm({
                     <SelectValue placeholder="Select main category" />
                   </SelectTrigger>
                   <SelectContent>
-                    {/* Parent categories are those with no parentId, OR
-                        categories that have children */}
+                    {/* Parent categories: those with children (hierarchical),
+                        OR all categories if none have children (flat structure) */}
                     {categories
-                      .filter(c => !c.parentId && c.children && c.children.length > 0)
+                      .filter(c => !c.parentId)
                       .map((c) => (
                         <SelectItem key={c.id} value={c.id}>
                           {c.name}
+                          {c.children && c.children.length > 0 ? '' : ''}
                         </SelectItem>
                       ))}
                   </SelectContent>
                 </Select>
 
                 {/* Step 2: Subcategory (e.g. Dress Shirts, Casual Shirts) —
-                    only shown when a parent is selected and has children */}
+                    only shown when a parent is selected and has children.
+                    If no children exist (flat structure), the parent IS the category. */}
                 {parentCategoryId && (() => {
                   const parent = categories.find(c => c.id === parentCategoryId)
                   const subcats = parent?.children ?? []
-                  if (subcats.length === 0) return null
+                  if (subcats.length === 0) {
+                    // Flat structure — the parent category is the product's category
+                    // Set categoryId to parentCategoryId if not already set
+                    if (categoryId !== parentCategoryId) setCategoryId(parentCategoryId)
+                    return null
+                  }
                   return (
                     <Select value={categoryId} onValueChange={setCategoryId}>
                       <SelectTrigger className="w-full">
