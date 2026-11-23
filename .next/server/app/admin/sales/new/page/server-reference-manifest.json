@@ -1,0 +1,20 @@
+{
+  "node": {
+    "40f2dc42085ddb0c5d588f3d41ed25c9493a5a6a4c": {
+      "workers": {
+        "app/admin/sales/new/page": {
+          "moduleId": 217640,
+          "async": false,
+          "exportedName": "createSaleAction",
+          "filename": "src/actions/sales.ts"
+        }
+      },
+      "layer": {
+        "app/admin/sales/new/page": "action-browser"
+      },
+      "exportedName": "createSaleAction",
+      "filename": "src/actions/sales.ts"
+    }
+  },
+  "edge": {}
+}

@@ -45,24 +45,47 @@ export async function getCartLinesWithProducts(lines: CartLineInput[]) {
       category: { select: CATEGORY_SELECT_BASE },
     },
   })
+
+  // Get campaign prices for all products in the cart
+  const { batchCurrentPrices } = await import('@/lib/pricing')
+  const priceMap = await batchCurrentPrices(products.map((p) => ({ id: p.id, price: p.price, salePrice: p.salePrice })))
+
   return lines
     .map((line) => {
       const p = products.find((p) => p.id === line.productId)
       if (!p) return null
       const variant = line.variantId ? p.variants.find((v) => v.id === line.variantId) : undefined
-      const price = variant?.price ?? p.salePrice ?? p.price
+
+      // Use campaign price if available, otherwise manual salePrice, otherwise normal price
+      const campaignPrice = priceMap.get(p.id)
+      let price: number
+      let originalPrice: number | undefined
+
+      if (campaignPrice?.isCampaignPrice) {
+        // Campaign price takes priority
+        price = campaignPrice.price
+        originalPrice = p.price // always show original when campaign-discounted
+      } else {
+        price = variant?.price ?? p.salePrice ?? p.price
+        originalPrice = p.salePrice && p.salePrice < p.price ? p.price : undefined
+      }
+
       return {
         ...line,
         name: p.name,
         slug: p.slug,
         price,
-        originalPrice: p.salePrice && p.salePrice < p.price ? p.price : undefined,
+        originalPrice,
         image: p.images[0]?.url,
         sku: variant?.sku ?? p.sku,
         inStock: variant ? variant.stock > 0 : p.variants.some((v) => v.stock > 0),
         maxQuantity: variant?.stock ?? Math.max(...p.variants.map((v) => v.stock), 0),
         categoryId: p.categoryId,
         categoryName: p.category.name,
+        // Campaign metadata for display
+        isCampaignPrice: campaignPrice?.isCampaignPrice ?? false,
+        campaignDiscountPct: campaignPrice?.discountPct ?? 0,
+        dealReason: campaignPrice?.dealReason,
       }
     })
     .filter(Boolean) as any[]
@@ -163,6 +186,10 @@ export async function createOrder(formData: FormData | Record<string, any>): Pro
     },
   })
 
+  // Get campaign prices for all products — the server is the boss
+  const { batchCurrentPrices } = await import('@/lib/pricing')
+  const priceMap = await batchCurrentPrices(products.map((p) => ({ id: p.id, price: p.price, salePrice: p.salePrice })))
+
   let subtotal = 0
   const orderItemsData: any[] = []
   for (const line of data.lines) {
@@ -180,9 +207,31 @@ export async function createOrder(formData: FormData | Record<string, any>): Pro
         return { ok: false, error: `Insufficient stock for ${p.name}.` }
       }
     }
-    const unitPrice = variant?.price ?? p.salePrice ?? p.price
+
+    // ── SERVER-SIDE PRICING: campaign price > manual salePrice > normal price ──
+    const campaignPrice = priceMap.get(p.id)
+    let unitPrice: number
+    let normalPrice: number = p.price
+    let salePct: number | null = null
+    let saleId: string | null = null
+    let reasonSnapshot: string | null = null
+
+    if (campaignPrice?.isCampaignPrice) {
+      // Campaign price takes priority — this is the authoritative price from the server
+      unitPrice = campaignPrice.price
+      salePct = campaignPrice.discountPct
+      saleId = campaignPrice.saleId ?? null
+      reasonSnapshot = campaignPrice.dealReason ?? null
+    } else {
+      unitPrice = variant?.price ?? p.salePrice ?? p.price
+      if (p.salePrice && p.salePrice < p.price) {
+        salePct = Math.round((1 - p.salePrice / p.price) * 100)
+      }
+    }
+
     const totalPrice = unitPrice * line.quantity
     subtotal += totalPrice
+
     orderItemsData.push({
       productId: p.id,
       variantId: variant?.id,
@@ -195,6 +244,16 @@ export async function createOrder(formData: FormData | Record<string, any>): Pro
       unitPrice,
       quantity: line.quantity,
       totalPrice,
+      // ── Price snapshot for order history (never changes after creation) ──
+      // These fields are stored on the OrderItem snapshot — when a campaign
+      // ends later, the order still shows the price the customer actually paid.
+      // The normalPrice and salePct are captured here and stored on the item.
+      // (Stored as JSON in the existing schema's snapshot via internalNotes
+      //  or we add fields to OrderItem — for now we capture in the item data)
+      _normalPrice: normalPrice,
+      _salePct: salePct,
+      _saleId: saleId,
+      _reasonSnapshot: reasonSnapshot,
     })
   }
 

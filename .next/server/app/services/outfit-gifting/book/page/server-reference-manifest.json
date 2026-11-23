@@ -1,0 +1,20 @@
+{
+  "node": {
+    "401d5043905fe852af31ea4978e22c6a1a53002afc": {
+      "workers": {
+        "app/services/outfit-gifting/book/page": {
+          "moduleId": 591054,
+          "async": false,
+          "exportedName": "subscribeToNewsletter",
+          "filename": "src/actions/store.ts"
+        }
+      },
+      "layer": {
+        "app/services/outfit-gifting/book/page": "action-browser"
+      },
+      "exportedName": "subscribeToNewsletter",
+      "filename": "src/actions/store.ts"
+    }
+  },
+  "edge": {}
+}

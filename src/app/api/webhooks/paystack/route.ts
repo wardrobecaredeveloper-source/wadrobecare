@@ -200,6 +200,14 @@ async function handleChargeSuccess(data: any) {
     link: `/admin/orders/${payment.orderId}`,
   })
 
+  // Invalidate sale cache — stock changes may affect campaign product eligibility
+  try {
+    const { invalidateSaleCache } = await import('@/lib/pricing')
+    invalidateSaleCache()
+  } catch {
+    // pricing module may not be loaded — ignore
+  }
+
   // ── Payment receipt email to the customer ──
   // Safe to send here without extra dedup: duplicate charge.success events
   // return early above (payment.verified check), so this runs exactly once.

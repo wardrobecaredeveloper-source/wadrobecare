@@ -7,6 +7,7 @@ import { ShopByWorld } from '@/components/home/shop-by-world'
 import { TheEdit } from '@/components/home/the-edit'
 import { NewArrivals } from '@/components/home/new-arrivals'
 import { InstagramSection } from '@/components/home/instagram-section'
+import { HomeSaleSection } from '@/components/home/home-sale'
 
 export const dynamic = 'force-dynamic'
 import {
@@ -91,6 +92,9 @@ export default async function HomePage() {
 
         {/* 04 — Categories: Shop by World rail */}
         <ShopByWorld worlds={worlds} />
+
+        {/* 04b — Active sale promotional section */}
+        <HomeSaleSection />
 
         {/* 05 — Featured picks */}
         <TheEdit products={featured} />

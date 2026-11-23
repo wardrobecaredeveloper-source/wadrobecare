@@ -1,0 +1,95 @@
+{
+  "node": {
+    "40181b9a0bc141accf11911e52a19b826eaaecd142": {
+      "workers": {
+        "app/admin/sales/[id]/page": {
+          "moduleId": 636120,
+          "async": false,
+          "exportedName": "saveSaleDraftAction",
+          "filename": "src/actions/sales.ts"
+        }
+      },
+      "layer": {
+        "app/admin/sales/[id]/page": "action-browser"
+      },
+      "exportedName": "saveSaleDraftAction",
+      "filename": "src/actions/sales.ts"
+    },
+    "40a02738ae307f8bd7a65c3fa73bb2683d1097c419": {
+      "workers": {
+        "app/admin/sales/[id]/page": {
+          "moduleId": 636120,
+          "async": false,
+          "exportedName": "saveSaleItemsAction",
+          "filename": "src/actions/sales.ts"
+        }
+      },
+      "layer": {
+        "app/admin/sales/[id]/page": "action-browser"
+      },
+      "exportedName": "saveSaleItemsAction",
+      "filename": "src/actions/sales.ts"
+    },
+    "40db586e6dff38112e304597f7263a02eed99d6bd8": {
+      "workers": {
+        "app/admin/sales/[id]/page": {
+          "moduleId": 636120,
+          "async": false,
+          "exportedName": "submitSaleAction",
+          "filename": "src/actions/sales.ts"
+        }
+      },
+      "layer": {
+        "app/admin/sales/[id]/page": "action-browser"
+      },
+      "exportedName": "submitSaleAction",
+      "filename": "src/actions/sales.ts"
+    },
+    "40b81c66b9371ce9799d81a2291d01ad4a60e2d7f1": {
+      "workers": {
+        "app/admin/sales/[id]/page": {
+          "moduleId": 636120,
+          "async": false,
+          "exportedName": "approveSaleAction",
+          "filename": "src/actions/sales.ts"
+        }
+      },
+      "layer": {
+        "app/admin/sales/[id]/page": "action-browser"
+      },
+      "exportedName": "approveSaleAction",
+      "filename": "src/actions/sales.ts"
+    },
+    "4039c975039d6bc9bb49a42099356db0c458bde998": {
+      "workers": {
+        "app/admin/sales/[id]/page": {
+          "moduleId": 636120,
+          "async": false,
+          "exportedName": "endSaleAction",
+          "filename": "src/actions/sales.ts"
+        }
+      },
+      "layer": {
+        "app/admin/sales/[id]/page": "action-browser"
+      },
+      "exportedName": "endSaleAction",
+      "filename": "src/actions/sales.ts"
+    },
+    "40c878cc767ac5eac6bf8d7d3b0ac0b64a7ff8d5c1": {
+      "workers": {
+        "app/admin/sales/[id]/page": {
+          "moduleId": 636120,
+          "async": false,
+          "exportedName": "deleteSaleAction",
+          "filename": "src/actions/sales.ts"
+        }
+      },
+      "layer": {
+        "app/admin/sales/[id]/page": "action-browser"
+      },
+      "exportedName": "deleteSaleAction",
+      "filename": "src/actions/sales.ts"
+    }
+  },
+  "edge": {}
+}
