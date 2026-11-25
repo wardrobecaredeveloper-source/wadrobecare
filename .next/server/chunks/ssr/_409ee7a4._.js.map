@@ -1,1 +1,0 @@
-{"version":3,"sources":["../../../../.next-internal/server/app/admin/brands/page/actions.js%20%28server%20actions%20loader%29"],"sourcesContent":["export {adminDeleteBrand as '402d069e9ea7882cc3e9944171383e958cdc1bb920'} from 'ACTIONS_MODULE0'\n"],"names":[],"mappings":"wCAAA,IAAA,EAAA,EAAA,CAAA,CAAA"}

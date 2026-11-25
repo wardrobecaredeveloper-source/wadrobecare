@@ -1,7 +1,0 @@
-{
-  "/api/seo/redirect-lookup/route": "app/api/seo/redirect-lookup/route.js",
-  "/page": "app/page.js",
-  "/product/[slug]/page": "app/product/[slug]/page.js",
-  "/shop/page": "app/shop/page.js",
-  "/sitemap.xml/route": "app/sitemap.xml/route.js"
-}
