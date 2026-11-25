@@ -43,8 +43,6 @@ jobs:
       # printed. Only used during `prisma generate` in the build step; the
       # runtime Worker uses the Hyperdrive binding instead.
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      # Tell vinext/email stack we are building for production.
-      NODE_ENV: production
 
     steps:
       - name: Checkout
@@ -57,7 +55,12 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        # `--include=dev` ensures devDependencies (vite, @vitejs/plugin-react,
+        # @vitejs/plugin-rsc, @cloudflare/vite-plugin, @prisma/adapter-pg)
+        # are installed. Without this, a CI runner that has NODE_ENV=production
+        # set globally (or other npm defaults) would skip them, and `vite build`
+        # would fail with "vite: not found".
+        run: npm ci --include=dev
 
       - name: Generate Prisma client
         run: npx prisma generate
@@ -70,6 +73,8 @@ jobs:
           # DATABASE_URL for the prisma generate step above (which is a no-op
           # if the client is already generated).
           HYPERDRIVE_ID: ${{ secrets.HYPERDRIVE_ID }}
+          # Production mode for the actual build (not for npm ci above).
+          NODE_ENV: production
 
       - name: Verify Hyperdrive id is set
         if: ${{ env.HYPERDRIVE_ID == '' }}
