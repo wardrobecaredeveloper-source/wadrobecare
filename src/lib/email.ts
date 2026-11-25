@@ -65,13 +65,44 @@ function fromAddress(): string {
   return process.env.EMAIL_FROM || 'Wardrobecare Clothing <onboarding@resend.dev>'
 }
 
+/**
+ * Detect whether we are running on Cloudflare Workers. The `cloudflare:workers`
+ * module only resolves inside the Workers runtime — attempting to import it
+ * on Node/Vercel throws synchronously. We cache the result so we only pay
+ * the import cost once per process / isolate.
+ */
+let _runtimeCache: boolean | undefined
+async function detectCloudflareWorkers(): Promise<boolean> {
+  try {
+    await import('cloudflare:workers')
+    return true
+  } catch {
+    return false
+  }
+}
+
 function baseUrl(): string {
   return (process.env.NEXTAUTH_URL || 'http://localhost:3000').replace(/\/+$/, '')
 }
 
 /**
  * Low-level send. Never throws — every failure is captured and logged.
- * Tries Gmail SMTP first (if configured), then falls back to Resend.
+ *
+ * Provider order is controlled by the EMAIL_PROVIDER env var:
+ *   • "resend"  → Resend HTTP API first; falls back to Gmail SMTP.
+ *   • "gmail"   → Gmail SMTP first; falls back to Resend HTTP API.
+ *
+ * DEFAULT (when EMAIL_PROVIDER is unset):
+ *   • On Cloudflare Workers  → "resend"  (Gmail SMTP can't run on Workers)
+ *   • On Vercel / Node       → "gmail"   (preserves existing Vercel behaviour
+ *                                        until Resend is verified end-to-end
+ *                                        on Cloudflare — at which point you
+ *                                        can set EMAIL_PROVIDER=resend on
+ *                                        Vercel too, or remove this default)
+ *
+ * The Gmail code path is intentionally NOT removed — it stays available
+ * for Vercel and local dev until every email workflow is verified working
+ * through Resend on the Cloudflare Worker.
  */
 export async function sendEmail(input: {
   to: string
@@ -80,9 +111,61 @@ export async function sendEmail(input: {
   text?: string
   replyTo?: string
 }): Promise<EmailSendResult> {
-  // ── Try Gmail SMTP first ──
-  // Gmail is the primary email provider for Wardrobecare (more reliable
-  // for Nigerian delivery than Resend's shared IP pool).
+  // Detect runtime by attempting to import the Workers-only module.
+  // On Cloudflare Workers it succeeds; on Node/Vercel it throws.
+  // We cache the result so we only pay the import cost once.
+  if (_runtimeCache === undefined) {
+    _runtimeCache = await detectCloudflareWorkers()
+  }
+  const defaultProvider = _runtimeCache ? 'resend' : 'gmail'
+  const providerPref = (
+    process.env.EMAIL_PROVIDER ||
+    defaultProvider
+  ).toLowerCase()
+
+  if (providerPref === 'gmail') {
+    // ── Gmail-first path (legacy / Node-only) ──
+    try {
+      const { sendGmail, gmailConfigured } = await import('@/lib/gmail')
+      if (gmailConfigured()) {
+        const result = await sendGmail({
+          to: input.to,
+          subject: input.subject,
+          html: input.html,
+        })
+        if (result.ok) {
+          console.log(`[email] gmail sent "${input.subject}" → ${input.to}`)
+          return { ok: true, id: result.messageId }
+        }
+        console.error(`[email] gmail failed, falling back to Resend: ${result.error}`)
+      }
+    } catch (e: any) {
+      console.error(`[email] gmail import/send error, falling back to Resend: ${e?.message}`)
+    }
+    // Fall through to Resend below.
+  } else {
+    // ── Resend-first path (default, Cloudflare-compatible) ──
+    // We try Resend first. If RESEND_API_KEY is missing or the request
+    // fails AND Gmail is configured (Node runtime only — Gmail SMTP
+    // won't work on Workers but we attempt it anyway so the error
+    // is loud and observable during verification), fall back to Gmail.
+    if (emailConfigured()) {
+      const resendResult = await sendViaResend(input)
+      if (resendResult.ok) return resendResult
+      // Resend failed — log and try Gmail as last-resort fallback.
+      console.error(
+        `[email] resend failed (${resendResult.error}); trying Gmail fallback for "${input.subject}" → ${input.to}`,
+      )
+    } else {
+      console.log(
+        `[email] resend not configured; trying Gmail fallback for "${input.subject}" → ${input.to}`,
+      )
+    }
+    // Fall through to Gmail attempt below.
+  }
+
+  // ── Gmail fallback (only runs when Resend-first path didn't succeed, ──
+  //    or Gmail-first path requested via EMAIL_PROVIDER=gmail).
   try {
     const { sendGmail, gmailConfigured } = await import('@/lib/gmail')
     if (gmailConfigured()) {
@@ -92,21 +175,40 @@ export async function sendEmail(input: {
         html: input.html,
       })
       if (result.ok) {
-        console.log(`[email] gmail sent "${input.subject}" → ${input.to}`)
+        console.log(
+          `[email] gmail (fallback) sent "${input.subject}" → ${input.to}`,
+        )
         return { ok: true, id: result.messageId }
       }
-      console.error(`[email] gmail failed, falling back to Resend: ${result.error}`)
+      console.error(`[email] gmail fallback also failed: ${result.error}`)
+      return { ok: false, error: result.error || 'gmail-fallback-failed' }
     }
   } catch (e: any) {
-    console.error(`[email] gmail import/send error, falling back to Resend: ${e?.message}`)
+    console.error(
+      `[email] gmail fallback import/send error: ${e?.message} (this is expected on Cloudflare Workers — Gmail SMTP cannot run there)`,
+    )
   }
 
-  // ── Fallback: Resend ──
+  console.log(
+    `[email] skipped (no provider succeeded): "${input.subject}" → ${input.to}`,
+  )
+  return { ok: false, skipped: true, error: 'no-provider-succeeded' }
+}
+
+/**
+ * Resend HTTP API send. Pure fetch — works on Cloudflare Workers.
+ * Never throws; failures return { ok: false, error }.
+ */
+async function sendViaResend(input: {
+  to: string
+  subject: string
+  html: string
+  text?: string
+  replyTo?: string
+}): Promise<EmailSendResult> {
   if (!emailConfigured()) {
-    console.log(`[email] skipped (neither Gmail nor Resend configured): "${input.subject}" → ${input.to}`)
-    return { ok: false, skipped: true, error: 'email-not-configured' }
+    return { ok: false, skipped: true, error: 'resend-not-configured' }
   }
-
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS)
 
@@ -130,16 +232,20 @@ export async function sendEmail(input: {
 
     if (!res.ok) {
       const body = await res.text().catch(() => '')
-      console.error(`[email] resend ${res.status} for "${input.subject}" → ${input.to}: ${body.slice(0, 300)}`)
+      console.error(
+        `[email] resend ${res.status} for "${input.subject}" → ${input.to}: ${body.slice(0, 300)}`,
+      )
       return { ok: false, error: `resend-${res.status}` }
     }
 
     const data: any = await res.json().catch(() => ({}))
-    console.log(`[email] resend sent "${input.subject}" → ${input.to} (id: ${data?.id ?? '?'})`)
+    console.log(
+      `[email] resend sent "${input.subject}" → ${input.to} (id: ${data?.id ?? '?'})`,
+    )
     return { ok: true, id: data?.id }
   } catch (e: any) {
     const reason = e?.name === 'AbortError' ? 'timeout' : e?.message
-    console.error(`[email] failed "${input.subject}" → ${input.to}: ${reason}`)
+    console.error(`[email] resend failed "${input.subject}" → ${input.to}: ${reason}`)
     return { ok: false, error: String(reason) }
   } finally {
     clearTimeout(timer)

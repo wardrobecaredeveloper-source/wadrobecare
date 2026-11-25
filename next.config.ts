@@ -5,6 +5,13 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
+  // `pg` and `@prisma/adapter-pg` are Node-only packages used by the
+  // Prisma driver adapter on Cloudflare Workers (via Hyperdrive). They
+  // pull in `net`, `tls`, and other Node built-ins that don't exist in
+  // the browser. Marking them as server-only prevents Next.js from
+  // trying to bundle them for Client Components (which would fail
+  // `next build` with "module not found" errors in the browser bundle).
+  serverExternalPackages: ["pg", "@prisma/adapter-pg", "nodemailer"],
   allowedDevOrigins: [
     "preview-*.space-z.ai",
     "*.space-z.ai",

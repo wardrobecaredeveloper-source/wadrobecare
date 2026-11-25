@@ -6,3 +6,16 @@ run-next.sh
 start-dev.sh
 start-next.js
 download/
+/dist/
+.vinext/
+.cloudflare/
+.next/
+tsconfig.tsbuildinfo
+tool-results/
+extracted/
+*.mp4
+*.zip
+.env
+.env.local
+.env.production
+.env.development

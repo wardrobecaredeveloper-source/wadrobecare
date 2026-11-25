@@ -1,0 +1,100 @@
+name: Deploy to Cloudflare Workers
+
+# Triggers:
+#   - Any push to main  → builds + deploys the Wardrobecare Worker + Response Store Worker
+#   - Manual run via the Actions tab (workflow_dispatch) → same
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Prevent two deploys from running concurrently and stepping on each other.
+concurrency:
+  group: cloudflare-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build + deploy Wardrobecare to Cloudflare Workers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Required GitHub secrets (Settings → Secrets and variables → Actions):
+    #
+    #   CLOUDFLARE_API_TOKEN    Cloudflare API token with these permissions:
+    #                             Account → Workers Scripts → Edit
+    #                             Account → Workers R2 Storage → Edit
+    #                             Account → D1 → Edit
+    #                             Account → Hyperdrive → Edit
+    #                             Zone  → Workers Routes → Edit (if using a custom domain)
+    #                             Create at: https://dash.cloudflare.com/profile/api-tokens
+    #                             Template: "Edit Cloudflare Workers" + add Hyperdrive edit
+    #
+    #   CLOUDFLARE_ACCOUNT_ID   Your account id (dashboard → any Worker → Settings → Account ID)
+    #
+    #   HYPERDRIVE_ID           The id returned by `wrangler hyperdrive create wardrobecare-db …`
+    #                           (set up once before the first deploy)
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      HYPERDRIVE_ID: ${{ secrets.HYPERDRIVE_ID }}
+      # Prisma needs a DATABASE_URL at generate time. Use the Neon pooled URL
+      # (same one Hyperdrive points at). Stored as a GitHub secret — never
+      # printed. Only used during `prisma generate` in the build step; the
+      # runtime Worker uses the Hyperdrive binding instead.
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Tell vinext/email stack we are building for production.
+      NODE_ENV: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Build Wardrobecare Worker
+        run: npm run build:vinext
+        env:
+          # vinext reads this at build time to know which environment to build.
+          # The build itself does NOT make DB connections — it only needs
+          # DATABASE_URL for the prisma generate step above (which is a no-op
+          # if the client is already generated).
+          HYPERDRIVE_ID: ${{ secrets.HYPERDRIVE_ID }}
+
+      - name: Verify Hyperdrive id is set
+        if: ${{ env.HYPERDRIVE_ID == '' }}
+        run: |
+          echo "::error::HYPERDRIVE_ID GitHub secret is empty. Create the Hyperdrive config with:"
+          echo "::error::  wrangler hyperdrive create wardrobecare-db --connection-string=…"
+          echo "::error::Then add the printed id as a GitHub secret named HYPERDRIVE_ID."
+          exit 1
+
+      - name: Deploy Response Store Worker (auxiliary cache)
+        run: npm run deploy:response-store
+
+      - name: Deploy Wardrobecare Worker (main app)
+        run: npm run deploy:vinext
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Deploy result" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Deployed to Cloudflare Workers" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Worker URL: https://wardrobecare.\${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.workers.dev" >> $GITHUB_STEP_SUMMARY
+            echo "Verify by visiting the URL and running through the test checklist in download/CLOUDFLARE-DEPLOY-RUNBOOK.md" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Deploy failed. Check the logs above." >> $GITHUB_STEP_SUMMARY
+          fi
