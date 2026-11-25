@@ -1,10 +1,10 @@
 {
   "node": {
-    "401d5043905fe852af31ea4978e22c6a1a53002afc": {
+    "40d6b3957e5c60edd4e4f2e64b494899c36255b4fd": {
       "workers": {
         "app/services/outfit-gifting/book/page": {
           "moduleId": 591054,
-          "async": false,
+          "async": true,
           "exportedName": "subscribeToNewsletter",
           "filename": "src/actions/store.ts"
         }

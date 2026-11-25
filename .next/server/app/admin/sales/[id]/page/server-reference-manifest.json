@@ -1,10 +1,10 @@
 {
   "node": {
-    "40181b9a0bc141accf11911e52a19b826eaaecd142": {
+    "4014df244df080000c41d6e0fc131b6aa630b378f0": {
       "workers": {
         "app/admin/sales/[id]/page": {
           "moduleId": 636120,
-          "async": false,
+          "async": true,
           "exportedName": "saveSaleDraftAction",
           "filename": "src/actions/sales.ts"
         }
@@ -15,11 +15,11 @@
       "exportedName": "saveSaleDraftAction",
       "filename": "src/actions/sales.ts"
     },
-    "40a02738ae307f8bd7a65c3fa73bb2683d1097c419": {
+    "4034f95fc1f259e4a608538c7149102aa656dd1029": {
       "workers": {
         "app/admin/sales/[id]/page": {
           "moduleId": 636120,
-          "async": false,
+          "async": true,
           "exportedName": "saveSaleItemsAction",
           "filename": "src/actions/sales.ts"
         }
@@ -30,11 +30,11 @@
       "exportedName": "saveSaleItemsAction",
       "filename": "src/actions/sales.ts"
     },
-    "40db586e6dff38112e304597f7263a02eed99d6bd8": {
+    "403d6548d32191a6158068309ecab9c5c87b4b271a": {
       "workers": {
         "app/admin/sales/[id]/page": {
           "moduleId": 636120,
-          "async": false,
+          "async": true,
           "exportedName": "submitSaleAction",
           "filename": "src/actions/sales.ts"
         }
@@ -45,11 +45,11 @@
       "exportedName": "submitSaleAction",
       "filename": "src/actions/sales.ts"
     },
-    "40b81c66b9371ce9799d81a2291d01ad4a60e2d7f1": {
+    "402732b44bdcb50fb1b256a0a783c9fb8e88f3184f": {
       "workers": {
         "app/admin/sales/[id]/page": {
           "moduleId": 636120,
-          "async": false,
+          "async": true,
           "exportedName": "approveSaleAction",
           "filename": "src/actions/sales.ts"
         }
@@ -60,11 +60,11 @@
       "exportedName": "approveSaleAction",
       "filename": "src/actions/sales.ts"
     },
-    "4039c975039d6bc9bb49a42099356db0c458bde998": {
+    "40da34f59bb28ffede166bf5565a94be7af0e86f33": {
       "workers": {
         "app/admin/sales/[id]/page": {
           "moduleId": 636120,
-          "async": false,
+          "async": true,
           "exportedName": "endSaleAction",
           "filename": "src/actions/sales.ts"
         }
@@ -75,11 +75,11 @@
       "exportedName": "endSaleAction",
       "filename": "src/actions/sales.ts"
     },
-    "40c878cc767ac5eac6bf8d7d3b0ac0b64a7ff8d5c1": {
+    "40ded53f2ea89ad99ff1cccf320254b2bb2565796c": {
       "workers": {
         "app/admin/sales/[id]/page": {
           "moduleId": 636120,
-          "async": false,
+          "async": true,
           "exportedName": "deleteSaleAction",
           "filename": "src/actions/sales.ts"
         }
