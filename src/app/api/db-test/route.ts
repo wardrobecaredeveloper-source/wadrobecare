@@ -51,7 +51,7 @@ export async function GET() {
     diagnostics.runtime.cloudflareWorkersError = e?.message;
   }
 
-  // Now try the actual Prisma client
+  // Now try the actual Prisma client — but also log what's happening
   try {
     const { db } = await import("@/lib/db");
     diagnostics.prisma = "imported";
@@ -63,8 +63,36 @@ export async function GET() {
     diagnostics.prisma = "failed";
     diagnostics.prismaError = {
       name: e?.name,
-      message: e?.message?.slice(0, 300),
-      stack: e?.stack?.split("\n").slice(0, 5).join("\n"),
+      message: e?.message?.slice(0, 500),
+      stack: e?.stack?.split("\n").slice(0, 8).join("\n"),
+    };
+  }
+
+  // Test 2: directly create a PrismaClient with adapter to see if THAT works
+  try {
+    const cfModule: any = await import("cloudflare:workers");
+    const hyperdrive = cfModule?.env?.HYPERDRIVE;
+    if (hyperdrive?.connectionString) {
+      const pgMod: any = await import("pg");
+      const adapterMod: any = await import("@prisma/adapter-pg");
+      const { PrismaClient } = await import("@prisma/client");
+      const pool = new pgMod.Pool({
+        connectionString: hyperdrive.connectionString,
+      });
+      const adapter = new adapterMod.PrismaPg(pool);
+      const directDb = new PrismaClient({ adapter, log: ["error"] });
+      const directCount = await directDb.user.count();
+      diagnostics.directTest = "success";
+      diagnostics.directUserCount = directCount;
+      await pool.end();
+    } else {
+      diagnostics.directTest = "no-hyperdrive-binding";
+    }
+  } catch (e: any) {
+    diagnostics.directTest = "failed";
+    diagnostics.directError = {
+      name: e?.name,
+      message: e?.message?.slice(0, 500),
     };
   }
 
