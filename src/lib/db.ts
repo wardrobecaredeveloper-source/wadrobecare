@@ -3,24 +3,10 @@ import { PrismaClient } from '@prisma/client'
 /**
  * Wardrobecare Prisma client — runtime-aware AND per-request on Workers.
  *
- *  - Local dev / Vercel: uses Prisma's built-in postgres driver over raw TCP.
- *                        This is the original behaviour; nothing changes.
- *  - Cloudflare Workers:  raw TCP is unavailable AND Prisma's binary query
- *                        engine cannot run (it generated for a different
- *                        OpenSSL runtime). We use the @prisma/adapter-pg
- *                        driver adapter with the `pg` package, which talks
- *                        to Neon via a Cloudflare Hyperdrive binding (TCP-
- *                        over-HTTP through Cloudflare's `nodejs_compat`
- *                        socket API).
- *
  * PER-REQUEST PATTERN ON WORKERS (critical):
- *   Cloudflare Hyperdrive docs are explicit: "The client belongs inside
- *   the handler. Hyperdrive maintains the reusable origin pool." (see
- *   https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/prisma-postgres
- *   and the discussion at
- *   https://github.com/prisma/prisma/issues/28193 — "Worker hangs and
- *   times out when trying to reuse a Prisma client instance across
- *   requests").
+ *   Cloudflare Hyperdrive docs: "The client belongs inside the handler.
+ *   Hyperdrive maintains the reusable origin pool."
+ *   (https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/prisma-postgres)
  *
  *   Hyperdrive's `env.HYPERDRIVE.connectionString` is a per-request value
  *   — each request gets a fresh string from the binding. The connection
@@ -28,7 +14,7 @@ import { PrismaClient } from '@prisma/client'
  *   the FIRST request's connection string, subsequent requests use a
  *   stale/expired token and fail.
  *
- *   So on Workers we create a NEW PrismaClient on every access, using
+ *   So on Workers we create a NEW PrismaClient on every query, using
  *   the LATEST `env.HYPERDRIVE.connectionString`. Hyperdrive pools the
  *   underlying TCP connections at the edge, so each new client is cheap
  *   (no new TCP handshake to Neon).
@@ -36,14 +22,18 @@ import { PrismaClient } from '@prisma/client'
  * API COMPATIBILITY:
  *   The exported `db` keeps the same call surface — `db.user.findUnique()`,
  *   `db.order.findMany()`, etc. — no call-site changes needed. Under the
- *   hood on Workers, each property access on `db` returns a fresh client
- *   bound to the current request's Hyperdrive connection string.
+ *   hood on Workers, `db` is a thenable Proxy. When the caller does
+ *   `await db.user.findUnique(...)`, the Proxy intercepts the property
+ *   access `db.user`, builds a fresh PrismaClient (which is a Promise
+ *   because the import + adapter setup is async), and forwards the
+ *   `.user` access onto the resolved client.
  *
- *   The slight overhead (creating a PrismaClient per query) is acceptable
- *   because: (a) the Wasm engine is already loaded into the isolate, so
- *   constructing a client is just object setup; (b) Hyperdrive's connection
- *   pool absorbs the actual TCP cost; (c) per-request isolation avoids the
- *   "Worker hangs when reusing Prisma client" issue.
+ *   The Proxy pattern works because:
+ *     - `db.user` returns a Promise that resolves to `client.user`
+ *     - Calling `.findUnique(...)` on that Promise returns a Promise
+ *       (because Promises forward property accesses onto their resolved
+ *       value via `.then(x => x.user.findUnique(...))`)
+ *     - `await` on the outer Promise resolves to the query result
  */
 
 const globalForPrisma = globalThis as unknown as {
@@ -51,10 +41,7 @@ const globalForPrisma = globalThis as unknown as {
 }
 
 /**
- * Validate DATABASE_URL on Node/Vercel. Prisma's own error is cryptic and
- * points at `schema.prisma:14` which sends people hunting in the wrong
- * place. This pre-flight check logs a clear, actionable message before
- * Prisma ever sees the value.
+ * Validate DATABASE_URL on Node/Vercel. Prisma's own error is cryptic.
  */
 function validateDatabaseUrl(label: string): void {
   const url = process.env.DATABASE_URL
@@ -82,10 +69,6 @@ function validateDatabaseUrl(label: string): void {
 
 /**
  * Detect if we're running on Cloudflare Workers.
- *
- *   1. `globalThis.navigator.userAgent` contains "Cloudflare-Workers"
- *      (set by the Workers runtime).
- *   2. Fallback: `process.versions` is undefined on Workers, defined on Node.
  */
 function isCloudflareWorkers(): boolean {
   try {
@@ -112,14 +95,7 @@ function isCloudflareWorkers(): boolean {
  * On Workers: build a fresh PrismaClient using the LATEST Hyperdrive
  * connection string from `cloudflare:workers` `env.HYPERDRIVE`.
  *
- * Hyperdrive's `connectionString` is per-request — caching the pool
- * across requests breaks with "Worker hangs when reusing Prisma client"
- * (see GitHub issue prisma/prisma#28193). Creating a fresh client per
- * call is the officially-recommended pattern.
- *
- * Falls back to DATABASE_URL secret if the Hyperdrive binding is somehow
- * missing (used only for the very first deploy before Hyperdrive is
- * wired up).
+ * Falls back to DATABASE_URL secret if the Hyperdrive binding is missing.
  */
 async function buildWorkersPrismaClient(): Promise<PrismaClient> {
   let connectionString: string | undefined
@@ -130,7 +106,6 @@ async function buildWorkersPrismaClient(): Promise<PrismaClient> {
     console.error('[db] cloudflare:workers import failed:', e?.message)
   }
   if (!connectionString) {
-    // Fallback to DATABASE_URL secret (only used if Hyperdrive binding missing)
     connectionString = process.env.DATABASE_URL
     if (!connectionString) {
       throw new Error(
@@ -150,27 +125,47 @@ let db: PrismaClient
 
 if (isCloudflareWorkers()) {
   // ─────────────────────────────────────────────────────────────────
-  // Cloudflare Workers path — per-request PrismaClient via Proxy.
+  // Cloudflare Workers path — per-request PrismaClient via async Proxy.
   // ─────────────────────────────────────────────────────────────────
-  // Each property access on `db` returns a fresh PrismaClient bound to
-  // the CURRENT request's Hyperdrive connection string. This avoids the
-  // "Worker hangs when reusing Prisma client across requests" issue
-  // (see https://github.com/prisma/prisma/issues/28193).
+  // `db` is a Proxy that forwards every property access onto a Promise
+  // that builds a fresh PrismaClient. Callers do `await db.user.findUnique()`
+  // which becomes:
+  //   1. `db.user` → Proxy.get('user') returns a "thenable" that, when awaited,
+  //      resolves to `client.user`
+  //   2. `(...).findUnique(...)` calls findUnique on the resolved value
+  //   3. The whole expression is awaited → resolves to the query result
   //
-  // Call surface stays the same: `await db.user.findUnique()`,
-  // `await db.order.findMany()`, etc. — no call-site changes.
-  console.log('[db] Cloudflare Workers runtime — per-request PrismaClient via Proxy')
+  // This avoids the "Worker hangs when reusing Prisma client across
+  // requests" issue (https://github.com/prisma/prisma/issues/28193).
+  console.log('[db] Cloudflare Workers runtime — per-request PrismaClient via async Proxy')
+
+  // Helper: build a "thenable" that resolves to the named property of a
+  // freshly-built PrismaClient. The property access itself is deferred
+  // until the caller awaits, so the import + adapter setup is lazy.
+  const accessProp = (prop: string | symbol) =>
+    new Promise((resolve, reject) => {
+      buildWorkersPrismaClient()
+        .then((client) => {
+          const value = (client as any)[prop]
+          if (value === undefined) {
+            reject(new Error(`PrismaClient has no property '${String(prop)}'`))
+          } else {
+            resolve(value)
+          }
+        })
+        .catch(reject)
+    })
+
   db = new Proxy({} as PrismaClient, {
-    get(_target, prop, receiver) {
-      // Each access creates a fresh client. The caller does
-      // `await db.user.findUnique(...)` which becomes:
-      //   const client = await buildWorkersPrismaClient()
-      //   return client.user.findUnique(...)
-      // The client is then garbage-collected after the await resolves.
-      const clientPromise = buildWorkersPrismaClient()
-      // Forward property access onto the in-flight promise so the
-      // caller's `await db.something` resolves to the real method.
-      return Reflect.get(clientPromise, prop, receiver)
+    get(_target, prop, _receiver) {
+      // Forward known Promise protocol properties so the Proxy itself
+      // can be awaited/inspected if needed (shouldn't be, but safe).
+      if (prop === 'then' || prop === 'catch' || prop === 'finally') {
+        return undefined
+      }
+      // For any other property (e.g. `user`, `order`, `product`),
+      // return a Promise that resolves to that property on a fresh client.
+      return accessProp(prop)
     },
   }) as PrismaClient
 } else {
