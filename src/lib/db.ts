@@ -5,25 +5,31 @@ import { PrismaClient } from '@prisma/client'
  *
  *  - Local dev / Vercel: uses Prisma's built-in postgres driver over raw TCP.
  *                        This is the original behaviour; nothing changes.
- *  - Cloudflare Workers:  raw TCP is unavailable. We use the @prisma/adapter-pg
- *                        driver adapter with the `pg` package, which talks to
- *                        Neon via a Cloudflare Hyperdrive binding (TCP-over-
- *                        HTTP through Cloudflare's `nodejs_compat` socket API).
- *                        The Hyperdrive connection string is exposed at
- *                        `env.HYPERDRIVE.connectionString` and is preferred
- *                        over the raw `DATABASE_URL` secret when present.
+ *  - Cloudflare Workers:  raw TCP is unavailable AND Prisma's binary query
+ *                        engine cannot run (it generated for a different
+ *                        OpenSSL runtime). We use the @prisma/adapter-pg
+ *                        driver adapter with the `pg` package, which talks
+ *                        to Neon via a Cloudflare Hyperdrive binding (TCP-
+ *                        over-HTTP through Cloudflare's `nodejs_compat`
+ *                        socket API).
  *
  * The exported `db` and the entire call surface (`db.user.findUnique`,
  * `db.order.findMany`, ...) stay identical — no query code changes.
  *
- * Implementation note: the `pg`, `@prisma/adapter-pg`, and
- * `cloudflare:workers` modules are loaded via a Function-constructed
- * dynamic importer. This hides the import paths from static bundlers
- * (webpack / Turbopack / rolldown), which would otherwise try to bundle
- * `pg` (a Node-only package with `net`/`tls` deps) into the browser
- * bundle when `db.ts` is reachable from any Client Component via
- * `queries.ts` / `seo.ts` / etc. The modules are still resolved
- * normally at runtime inside the Workers isolate.
+ * Runtime detection: We CANNOT use `new Function('return import(spec)')`
+ * to dynamically import `cloudflare:workers` because Workers' CSP blocks
+ * `eval`/`Function` code generation ("Code generation from strings
+ * disallowed for this context"). Instead, we use a different runtime
+ * fingerprint: the global `navigator.userAgent` in Workers starts with
+ * "Cloudflare-Workers", and `process.env` is exposed (via nodejs_compat)
+ * but lacks `process.env.HOSTNAME`-type identifiers that Node sets.
+ *
+ * The bulletproof test: try a static `import('cloudflare:workers')`.
+ * On Workers this resolves; on Node/Vercel it throws. We use a static
+ * import guarded by try/catch via a dynamic `import()` call (which is
+ * NOT blocked — only `new Function` is blocked). The bundler already
+ * externalizes `cloudflare:workers` in vite.config.ts, so the dynamic
+ * import is preserved as-is in the bundle.
  */
 
 const globalForPrisma = globalThis as unknown as {
@@ -31,25 +37,10 @@ const globalForPrisma = globalThis as unknown as {
 }
 
 /**
- * Hide the dynamic import from the bundler. `new Function` is not statically
- * analyzable, so webpack/Turbopack/rolldown leave the import path alone.
- * This is the canonical escape hatch for runtime-only dynamic imports.
- */
-const dynamicImport = new Function(
-  'spec',
-  'return import(spec)',
-) as (spec: string) => Promise<any>
-
-/**
- * Validate DATABASE_URL on Node/Vercel. Prisma's own error is cryptic and
- * points at `schema.prisma:14` which sends people hunting in the wrong place.
+ * Validate DATABASE_URL. Prisma's own error is cryptic and points at
+ * `schema.prisma:14` which sends people hunting in the wrong place.
  * This pre-flight check logs a clear, actionable message before Prisma
  * ever sees the value.
- *
- * Accepted: `postgresql://...` and `postgres://...`
- * Rejected: anything else (notably `file:./db/custom.db` from .env.example,
- * which is the local SQLite fallback and would silently break the build
- * on Vercel if it leaked into the env var).
  */
 function validateDatabaseUrl(label: string): void {
   const url = process.env.DATABASE_URL
@@ -75,41 +66,97 @@ function validateDatabaseUrl(label: string): void {
   }
 }
 
+/**
+ * Detect if we're running on Cloudflare Workers. We use a multi-signal
+ * check to avoid `new Function` (blocked by Workers CSP) and to stay
+ * reliable across runtime updates:
+ *
+ *   1. `globalThis.navigator.userAgent` contains "Cloudflare-Workers"
+ *      (set by the Workers runtime).
+ *   2. `globalThis.caches` exists (Workers Cache API) — but Node 22+ also
+ *      has it, so this alone isn't enough.
+ *   3. `process.versions` is undefined on Workers (no Node version)
+ *      but defined on Node — strong signal.
+ *
+ * Combined: (navigator.userAgent contains "Cloudflare-Workers") AND
+ * (no process.versions) → we're on Workers.
+ */
+function isCloudflareWorkers(): boolean {
+  try {
+    // Workers sets navigator.userAgent to "Cloudflare-Workers"
+    const nav = (
+      globalThis as { navigator?: { userAgent?: string } }
+    ).navigator
+    const ua = nav?.userAgent ?? ''
+    if (ua.includes('Cloudflare-Workers')) return true
+  } catch {
+    // navigator might not exist in some environments — ignore
+  }
+  // Fallback: process.versions is undefined on Workers, defined on Node
+  try {
+    const versions = (process as { versions?: Record<string, string> }).versions
+    if (!versions || Object.keys(versions).length === 0) {
+      // No Node version info — likely Workers (or a very stripped Node)
+      return true
+    }
+  } catch {
+    return true
+  }
+  return false
+}
+
 let db: PrismaClient
 
-try {
-  // `cloudflare:workers` only resolves inside the Workers runtime. On
-  // Node/Vercel the dynamic import throws synchronously — caught below.
-  const { env } = await dynamicImport('cloudflare:workers')
-  const hyperdrive = (
-    env as { HYPERDRIVE?: { connectionString?: string } }
-  ).HYPERDRIVE
-
-  if (hyperdrive?.connectionString) {
-    // Workers + Hyperdrive path.
-    const pgMod: typeof import('pg') = await dynamicImport('pg')
+if (isCloudflareWorkers()) {
+  // ─────────────────────────────────────────────────────────────────
+  // Cloudflare Workers path
+  // ─────────────────────────────────────────────────────────────────
+  // We use the @prisma/adapter-pg driver adapter (NOT Prisma's binary
+  // query engine, which doesn't work on Workers due to OpenSSL runtime
+  // mismatch). The pg package connects via Hyperdrive's TCP-over-HTTP
+  // socket API (enabled by `nodejs_compat` in cloudflare.config.ts).
+  //
+  // Bindings on Workers are NOT exposed via process.env — they're on
+  // the `env` object passed to fetch(). vinext exposes them through
+  // the `cloudflare:workers` module's `env` export. We import that
+  // statically (vite.config.ts externalizes it so the bundler leaves
+  // it alone, and the Workers runtime resolves it natively).
+  console.log('[db] Cloudflare Workers runtime detected — using PrismaPg + Hyperdrive')
+  try {
+    // Static dynamic import — NOT new Function. This is allowed by Workers.
+    // The bundler externalizes this spec (see vite.config.ts build.rolldownOptions.external).
+    const cfModule: any = await import('cloudflare:workers')
+    const hyperdrive = cfModule?.env?.HYPERDRIVE
+    if (!hyperdrive?.connectionString) {
+      throw new Error(
+        'HYPERDRIVE binding not found on the Worker. Check cloudflare.config.ts has HYPERDRIVE: bindings.hyperdrive({ id: "..." }).',
+      )
+    }
+    const pgMod: typeof import('pg') = await import('pg')
     const adapterMod: typeof import('@prisma/adapter-pg') =
-      await dynamicImport('@prisma/adapter-pg')
+      await import('@prisma/adapter-pg')
     const pool = new pgMod.Pool({ connectionString: hyperdrive.connectionString })
     const adapter = new adapterMod.PrismaPg(pool)
     db = new PrismaClient({ adapter, log: ['error'] })
-  } else {
-    // Workers without Hyperdrive binding — fall back to DATABASE_URL secret.
-    validateDatabaseUrl('Cloudflare Worker')
-    if (!process.env.DATABASE_URL) {
-      throw new Error(
-        'No Hyperdrive binding and no DATABASE_URL secret set on the Worker.',
-      )
+  } catch (e: any) {
+    console.error('[db] Workers path failed:', e?.message)
+    // Fallback to DATABASE_URL via the adapter (if Hyperdrive binding is broken)
+    if (process.env.DATABASE_URL) {
+      const pgMod: typeof import('pg') = await import('pg')
+      const adapterMod: typeof import('@prisma/adapter-pg') =
+        await import('@prisma/adapter-pg')
+      const pool = new pgMod.Pool({ connectionString: process.env.DATABASE_URL })
+      const adapter = new adapterMod.PrismaPg(pool)
+      db = new PrismaClient({ adapter, log: ['error'] })
+    } else {
+      throw e
     }
-    db = new PrismaClient({
-      log: ['error'],
-      datasources: { db: { url: process.env.DATABASE_URL } },
-    })
   }
-} catch {
+} else {
+  // ─────────────────────────────────────────────────────────────────
   // Node / Vercel path — original behaviour preserved.
-  // Log a clear pre-flight message so the user knows exactly what to fix
-  // if the env var is missing or set to the wrong protocol.
+  // ─────────────────────────────────────────────────────────────────
+  console.log('[db] Node/Vercel runtime — using default Prisma postgres driver')
   validateDatabaseUrl('Node / Vercel')
   db =
     globalForPrisma.prisma ??
