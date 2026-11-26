@@ -17,21 +17,33 @@ export async function GET() {
     },
   };
 
-  // Try to import cloudflare:workers — this is the Workers-only module
+  // Runtime detection — same as db.ts
   try {
-    const dynamicImport = new Function(
-      "spec",
-      "return import(spec)",
-    ) as (spec: string) => Promise<any>;
-    const cfMod = await dynamicImport("cloudflare:workers");
+    const nav = (globalThis as { navigator?: { userAgent?: string } }).navigator;
+    const ua = nav?.userAgent ?? "";
+    diagnostics.runtime.navigatorUserAgent = ua;
+    diagnostics.runtime.isCloudflareWorkers =
+      ua.includes("Cloudflare-Workers") ||
+      !process.versions ||
+      Object.keys(process.versions || {}).length === 0;
+    diagnostics.runtime.processVersionsKeys = Object.keys(
+      process.versions || {},
+    );
+  } catch (e: any) {
+    diagnostics.runtime.detectionError = e?.message;
+  }
+
+  // Try to import cloudflare:workers — via static import, not new Function
+  try {
+    const cfMod: any = await import("cloudflare:workers");
     diagnostics.runtime.cloudflareWorkersImport = "success";
-    const env = cfMod.env || {};
+    const env = cfMod?.env || {};
     diagnostics.runtime.envKeys = Object.keys(env);
     diagnostics.runtime.hasHyperdrive = !!env.HYPERDRIVE;
     if (env.HYPERDRIVE) {
       diagnostics.runtime.hyperdriveKeys = Object.keys(env.HYPERDRIVE);
       diagnostics.runtime.hyperdriveConnectionString = env.HYPERDRIVE.connectionString
-        ? env.HYPERDRIVE.connectionString.slice(0, 40) + "..."
+        ? String(env.HYPERDRIVE.connectionString).slice(0, 40) + "..."
         : null;
     }
   } catch (e: any) {
