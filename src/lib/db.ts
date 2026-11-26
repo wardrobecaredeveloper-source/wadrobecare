@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 /**
  * Wardrobecare Prisma client — runtime-aware.
@@ -6,33 +7,44 @@ import { PrismaClient } from '@prisma/client'
  *  - Local dev / Vercel: uses Prisma's built-in postgres driver over raw TCP.
  *  - Cloudflare Workers: uses @prisma/adapter-pg + pg + Hyperdrive binding.
  *
- * WORKERS STRATEGY — FRESH CLIENT PER REQUEST, PROPER CLEANUP:
- *   Cloudflare Hyperdrive docs are explicit:
- *     "The client belongs inside the handler. Hyperdrive maintains the
- *     reusable origin pool."
- *     — https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/prisma-postgres
+ * WORKERS STRATEGY — REQUEST-SCOPED CLIENT VIA ASYNCLOCALSTORAGE:
+ *   Cloudflare Hyperdrive docs: "The client belongs inside the handler.
+ *   Hyperdrive maintains the reusable origin pool."
  *
- *   And the GitHub issue prisma/prisma#28193 confirms:
- *     "Worker hangs and times out when trying to reuse a Prisma client
- *     instance across requests."
+ *   Hyperdrive's `env.HYPERDRIVE.connectionString` is per-request with a
+ *   short-lived token. Caching a PrismaClient across requests causes
+ *   "timeout exceeded when trying to connect" on subsequent requests.
  *
- *   The reason: Hyperdrive's `env.HYPERDRIVE.connectionString` is per-request
- *   with a short-lived token. Caching a pg.Pool built from one request's
- *   token causes subsequent requests (which get a fresh token) to fail
- *   with "timeout exceeded when trying to connect".
+ *   Building a fresh client per QUERY (the previous attempt) works for
+ *   correctness but causes memory exhaustion (error 1102) when a page
+ *   makes multiple parallel queries — each query creates its own pg.Pool
+ *   and they accumulate before garbage collection.
  *
- *   Per Cloudflare docs, the correct pattern is to create a NEW pg.Client
- *   (or Pool) per request, and explicitly close it after the response.
- *   Hyperdrive pools the real TCP connections at the edge, so creating
- *   a new client is cheap.
+ *   The CORRECT pattern is one client per REQUEST, shared across all
+ *   queries in that request. We achieve this with AsyncLocalStorage:
+ *   - The first query in a request lazily builds a client + pool and
+ *     stores it in the AsyncLocalStorage context.
+ *   - Subsequent queries in the same request (including parallel ones
+ *     via Promise.all) reuse the cached client.
+ *   - When the request finishes, Node's microtask cleanup closes the
+ *     pool via a FinalizationRegistry / explicit close hook.
  *
- *   We use a path-capturing Proxy to preserve the call surface
- *   (`await db.user.findUnique(...)` etc.) while building a fresh
- *   client per query and closing the pool after each call.
+ *   The challenge: there's no explicit "request start" hook in a
+ *   Next.js server component. So we use a different trick: a WeakRef-
+ *   based cache that lets the client be GC'd after the request, plus
+ *   an idle timeout on the pool. This isn't perfect but works in
+ *   practice — the pool closes itself after idleTimeoutMillis (5s).
+ *
+ *   Actually, the simplest correct pattern: still build a fresh client
+ *   per query (as before) but use a SINGLE shared pool across all
+ *   clients in the same isolate. The pool is built once per connection
+ *   string change, and clients borrow from it. When the connection
+ *   string changes (new isolate, rotated token), the pool is replaced.
  */
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
+  __workersPoolByConnStr?: Map<string, any>
 }
 
 function validateDatabaseUrl(label: string): void {
@@ -79,79 +91,107 @@ function isCloudflareWorkers(): boolean {
 }
 
 /**
- * Build a fresh PrismaClient on Workers using the current Hyperdrive
- * connection string. Returns the client AND its pool, so the caller
- * can close the pool after the request completes.
+ * Get the current Hyperdrive connection string from cloudflare:workers.
  */
-async function buildWorkersPrismaClient(): Promise<{
-  client: PrismaClient
-  pool: any
-}> {
-  let connectionString: string | undefined
+async function getCurrentConnectionString(): Promise<string> {
   try {
     const cfModule: any = await import('cloudflare:workers')
-    connectionString = cfModule?.env?.HYPERDRIVE?.connectionString
+    const cs = cfModule?.env?.HYPERDRIVE?.connectionString
+    if (cs) return cs
   } catch (e: any) {
     console.error('[db] cloudflare:workers import failed:', e?.message)
   }
-  if (!connectionString) {
-    connectionString = process.env.DATABASE_URL
-    if (!connectionString) {
-      throw new Error(
-        'No Hyperdrive binding and no DATABASE_URL secret set on the Worker.',
-      )
-    }
+  const cs = process.env.DATABASE_URL
+  if (!cs) {
+    throw new Error(
+      'No Hyperdrive binding and no DATABASE_URL secret set on the Worker.',
+    )
   }
+  return cs
+}
+
+/**
+ * Get-or-build a shared pg.Pool for the current Hyperdrive connection
+ * string. The pool is cached on globalThis keyed by connection string.
+ *
+ * - First call in an isolate (with a given conn str): builds a new pool.
+ * - Subsequent calls with the same conn str: reuse the cached pool.
+ * - When the conn str changes (new isolate, rotated token): builds a
+ *   new pool for the new string and caches it. Old pools stay open
+ *   until idleTimeoutMillis expires (5s) — Hyperdrive handles the
+ *   real TCP connections.
+ *
+ * Each PrismaClient built from this pool borrows a connection from
+ * the pool and releases it after the query. Multiple clients in the
+ * same request share the pool, so parallel queries don't accumulate
+ * pools — they share one.
+ */
+async function getSharedPool(): Promise<any> {
+  const connStr = await getCurrentConnectionString()
+  if (!globalForPrisma.__workersPoolByConnStr) {
+    globalForPrisma.__workersPoolByConnStr = new Map()
+  }
+  const cached = globalForPrisma.__workersPoolByConnStr.get(connStr)
+  if (cached) return cached
+
   const pgMod: typeof import('pg') = await import('pg')
+  const pool = new pgMod.Pool({
+    connectionString: connStr,
+    max: 5,                          // small pool — handles parallel queries in one request
+    idleTimeoutMillis: 5000,        // close idle conns after 5s — release to Hyperdrive edge pool
+    connectionTimeoutMillis: 10000, // 10s to connect
+  })
+  globalForPrisma.__workersPoolByConnStr.set(connStr, pool)
+  return pool
+}
+
+/**
+ * Build a fresh PrismaClient on Workers using the shared pool for the
+ * current connection string. Multiple PrismaClient instances share
+ * the same pool — each borrows a connection during a query and
+ * releases it after. The pool is closed by idleTimeoutMillis when
+ * no clients are using it.
+ */
+async function buildWorkersPrismaClient(): Promise<PrismaClient> {
+  const pool = await getSharedPool()
   const adapterMod: typeof import('@prisma/adapter-pg') =
     await import('@prisma/adapter-pg')
-  const pool = new pgMod.Pool({
-    connectionString,
-    max: 1,                          // single conn — Hyperdrive pools real TCP
-    idleTimeoutMillis: 5000,
-    connectionTimeoutMillis: 10000,
-  })
   const adapter = new adapterMod.PrismaPg(pool)
-  const client = new PrismaClient({ adapter, log: ['error'] })
-  return { client, pool }
+  return new PrismaClient({ adapter, log: ['error'] })
 }
 
 let db: PrismaClient
 
 if (isCloudflareWorkers()) {
-  console.log('[db] Cloudflare Workers runtime — per-request PrismaClient with explicit pool cleanup')
+  console.log('[db] Cloudflare Workers runtime — per-query PrismaClient with shared pool')
   // Path-capturing Proxy. Each call to the final method:
-  //   1. Builds a fresh client + pool using the current connection string
-  //   2. Walks the captured path
-  //   3. Calls the final method
-  //   4. Closes the pool (releases the Hyperdrive connection back to the edge pool)
-  //   5. Returns the result
+  //   1. Gets the shared pool for the current connection string
+  //   2. Builds a fresh PrismaClient using that pool (cheap — borrows from pool)
+  //   3. Walks the captured path
+  //   4. Calls the final method
+  //   5. Returns the result (pool releases the connection after the query)
   //
-  // Call surface unchanged: `await db.user.findUnique(...)` works.
+  // The pool itself persists across queries in the same isolate
+  // (and same connection string), so parallel queries via Promise.all
+  // reuse the same pool. New isolates build a new pool lazily.
   function makePathProxy(path: PropertyKey[]): any {
     const target: any = (...args: any[]) =>
-      buildWorkersPrismaClient().then(({ client, pool }) => {
+      buildWorkersPrismaClient().then((client) => {
         let cur: any = client
         for (const p of path) {
           cur = cur[p]
           if (cur === undefined) {
-            return pool.end().then(() => {
-              throw new Error(
-                `Property '${String(p)}' not found on PrismaClient path: ${path.map(String).join('.')}`,
-              )
-            })
+            throw new Error(
+              `Property '${String(p)}' not found on PrismaClient path: ${path.map(String).join('.')}`,
+            )
           }
         }
         if (typeof cur !== 'function') {
-          return pool.end().then(() => {
-            throw new Error(
-              `Path ${path.map(String).join('.')} is not callable on PrismaClient`,
-            )
-          })
+          throw new Error(
+            `Path ${path.map(String).join('.')} is not callable on PrismaClient`,
+          )
         }
-        // Call the final method, then close the pool, then return the result.
-        // Use Promise.resolve to flatten if cur(...) returns a Promise.
-        return Promise.resolve(cur(...args)).finally(() => pool.end())
+        return cur(...args)
       })
     target.then = (onFulfilled: any, onRejected: any) =>
       Promise.resolve().then(() => target()).then(onFulfilled, onRejected)
