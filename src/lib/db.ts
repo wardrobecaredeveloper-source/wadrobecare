@@ -6,30 +6,33 @@ import { PrismaClient } from '@prisma/client'
  *  - Local dev / Vercel: uses Prisma's built-in postgres driver over raw TCP.
  *  - Cloudflare Workers: uses @prisma/adapter-pg + pg + Hyperdrive binding.
  *
- * WORKERS POOL STRATEGY:
- *   Hyperdrive's `env.HYPERDRIVE.connectionString` is per-request, but
- *   the string is stable for the lifetime of a Worker isolate. We cache
- *   the PrismaClient keyed by connection string — when the string
- *   matches, we reuse the cached client (no rebuild, no reconnect).
- *   When the string changes (new isolate, or Hyperdrive rotates the
- *   token), we build a fresh client + pool with the new string.
+ * WORKERS STRATEGY — FRESH CLIENT PER REQUEST, PROPER CLEANUP:
+ *   Cloudflare Hyperdrive docs are explicit:
+ *     "The client belongs inside the handler. Hyperdrive maintains the
+ *     reusable origin pool."
+ *     — https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-database-providers/prisma-postgres
  *
- *   This avoids two failure modes:
- *     1. Caching a single client built from the FIRST request's
- *        connection string → fails on subsequent requests with
- *        "timeout exceeded when trying to connect" when the token expires.
- *     2. Building a fresh client per query → CPU/memory exhaustion
- *        (exceededResources) on heavy pages, because each Pool leaks
- *        until idleTimeoutMillis fires.
+ *   And the GitHub issue prisma/prisma#28193 confirms:
+ *     "Worker hangs and times out when trying to reuse a Prisma client
+ *     instance across requests."
  *
- *   Per-isolate caching matches Hyperdrive's per-isolate connection
- *   pooling model: each isolate gets ONE connection to Hyperdrive's
- *   edge pool, which itself pools real TCP connections to Neon.
+ *   The reason: Hyperdrive's `env.HYPERDRIVE.connectionString` is per-request
+ *   with a short-lived token. Caching a pg.Pool built from one request's
+ *   token causes subsequent requests (which get a fresh token) to fail
+ *   with "timeout exceeded when trying to connect".
+ *
+ *   Per Cloudflare docs, the correct pattern is to create a NEW pg.Client
+ *   (or Pool) per request, and explicitly close it after the response.
+ *   Hyperdrive pools the real TCP connections at the edge, so creating
+ *   a new client is cheap.
+ *
+ *   We use a path-capturing Proxy to preserve the call surface
+ *   (`await db.user.findUnique(...)` etc.) while building a fresh
+ *   client per query and closing the pool after each call.
  */
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
-  __workersPrismaByConnStr?: Map<string, { client: PrismaClient; pool: any }>
 }
 
 function validateDatabaseUrl(label: string): void {
@@ -76,113 +79,80 @@ function isCloudflareWorkers(): boolean {
 }
 
 /**
- * Get the current Hyperdrive connection string from cloudflare:workers.
- * On Workers, env.HYPERDRIVE.connectionString is exposed via the
- * `cloudflare:workers` module's `env` export. The string is per-request
- * but stable within an isolate — we cache the client keyed by it.
+ * Build a fresh PrismaClient on Workers using the current Hyperdrive
+ * connection string. Returns the client AND its pool, so the caller
+ * can close the pool after the request completes.
  */
-async function getCurrentConnectionString(): Promise<string> {
+async function buildWorkersPrismaClient(): Promise<{
+  client: PrismaClient
+  pool: any
+}> {
+  let connectionString: string | undefined
   try {
     const cfModule: any = await import('cloudflare:workers')
-    const cs = cfModule?.env?.HYPERDRIVE?.connectionString
-    if (cs) return cs
+    connectionString = cfModule?.env?.HYPERDRIVE?.connectionString
   } catch (e: any) {
     console.error('[db] cloudflare:workers import failed:', e?.message)
   }
-  // Fallback to DATABASE_URL secret
-  const cs = process.env.DATABASE_URL
-  if (!cs) {
-    throw new Error(
-      'No Hyperdrive binding and no DATABASE_URL secret set on the Worker.',
-    )
+  if (!connectionString) {
+    connectionString = process.env.DATABASE_URL
+    if (!connectionString) {
+      throw new Error(
+        'No Hyperdrive binding and no DATABASE_URL secret set on the Worker.',
+      )
+    }
   }
-  return cs
-}
-
-/**
- * On Workers: get-or-build a PrismaClient keyed by connection string.
- * Reuses cached client when string matches (common case within an isolate).
- * Builds fresh when string changes (new isolate, rotated token).
- */
-async function getWorkersPrismaClient(): Promise<PrismaClient> {
-  const connStr = await getCurrentConnectionString()
-  if (!globalForPrisma.__workersPrismaByConnStr) {
-    globalForPrisma.__workersPrismaByConnStr = new Map()
-  }
-  const cached = globalForPrisma.__workersPrismaByConnStr.get(connStr)
-  if (cached) return cached.client
-
   const pgMod: typeof import('pg') = await import('pg')
   const adapterMod: typeof import('@prisma/adapter-pg') =
     await import('@prisma/adapter-pg')
   const pool = new pgMod.Pool({
-    connectionString: connStr,
-    max: 1,                          // single conn per isolate — Hyperdrive pools real TCP at the edge
-    idleTimeoutMillis: 30000,        // 30s idle (longer than typical gap between isolate invocations)
-    connectionTimeoutMillis: 10000,  // 10s to connect to Hyperdrive
+    connectionString,
+    max: 1,                          // single conn — Hyperdrive pools real TCP
+    idleTimeoutMillis: 5000,
+    connectionTimeoutMillis: 10000,
   })
   const adapter = new adapterMod.PrismaPg(pool)
   const client = new PrismaClient({ adapter, log: ['error'] })
-  globalForPrisma.__workersPrismaByConnStr.set(connStr, { client, pool })
-  return client
+  return { client, pool }
 }
 
 let db: PrismaClient
 
 if (isCloudflareWorkers()) {
-  console.log('[db] Cloudflare Workers runtime — per-isolate PrismaClient cached by connection string')
-  // `db` is a Proxy that lazily resolves to the cached client for the
-  // current connection string on every property access. This means:
-  //   - First access in an isolate: builds a fresh client + pool
-  //   - Subsequent accesses in same isolate (same conn str): reuse cache
-  //   - After isolate restart or token rotation: builds fresh
+  console.log('[db] Cloudflare Workers runtime — per-request PrismaClient with explicit pool cleanup')
+  // Path-capturing Proxy. Each call to the final method:
+  //   1. Builds a fresh client + pool using the current connection string
+  //   2. Walks the captured path
+  //   3. Calls the final method
+  //   4. Closes the pool (releases the Hyperdrive connection back to the edge pool)
+  //   5. Returns the result
   //
-  // Call surface unchanged: `await db.user.findUnique()`,
-  // `await db.order.findMany()`, etc.
-  db = new Proxy({} as PrismaClient, {
-    get(_target, prop, _receiver) {
-      // Return a thenable that resolves to client[prop].
-      // The caller does `await db.user.findUnique(...)`:
-      //   1. db.user → Proxy.get('user') returns Promise P
-      //   2. P.findUnique(...) → P is thenable; .findUnique is undefined
-      //      on Promise.prototype. So we need a different approach.
-      //
-      // Instead: return a thenable that resolves to client[prop].
-      // When the caller awaits it then accesses .findUnique, the await
-      // resolves to client.user (an object), then .findUnique works.
-      //
-      // But callers don't await db.user — they do `db.user.findUnique()`
-      // and await the result. So we need a "Promise whose properties
-      // work after await" — i.e., return the actual client property
-      // via a chained thenable.
-      //
-      // Trick: return a thenable whose .then callback resolves to
-      // client[prop]. But we still need the caller to await BEFORE
-      // accessing .findUnique. They don't.
-      //
-      // So instead we use the path-capturing approach: build the client
-      // when the final method is called, not when properties are accessed.
-      return makePathProxy([prop])
-    },
-  }) as PrismaClient
-
+  // Call surface unchanged: `await db.user.findUnique(...)` works.
   function makePathProxy(path: PropertyKey[]): any {
-    const target: any = (...args: any[]) => {
-      // Build/retrieve cached client, walk path, call final method
-      return getWorkersPrismaClient().then((client) => {
+    const target: any = (...args: any[]) =>
+      buildWorkersPrismaClient().then(({ client, pool }) => {
         let cur: any = client
         for (const p of path) {
           cur = cur[p]
           if (cur === undefined) {
-            throw new Error(`Property '${String(p)}' not found on PrismaClient path: ${path.map(String).join('.')}`)
+            return pool.end().then(() => {
+              throw new Error(
+                `Property '${String(p)}' not found on PrismaClient path: ${path.map(String).join('.')}`,
+              )
+            })
           }
         }
         if (typeof cur !== 'function') {
-          throw new Error(`Path ${path.map(String).join('.')} is not callable on PrismaClient`)
+          return pool.end().then(() => {
+            throw new Error(
+              `Path ${path.map(String).join('.')} is not callable on PrismaClient`,
+            )
+          })
         }
-        return cur(...args)
+        // Call the final method, then close the pool, then return the result.
+        // Use Promise.resolve to flatten if cur(...) returns a Promise.
+        return Promise.resolve(cur(...args)).finally(() => pool.end())
       })
-    }
     target.then = (onFulfilled: any, onRejected: any) =>
       Promise.resolve().then(() => target()).then(onFulfilled, onRejected)
     target.catch = (onRejected: any) =>
@@ -203,6 +173,7 @@ if (isCloudflareWorkers()) {
       },
     })
   }
+  db = makePathProxy([]) as unknown as PrismaClient
 } else {
   console.log('[db] Node/Vercel runtime — using default Prisma postgres driver')
   validateDatabaseUrl('Node / Vercel')
