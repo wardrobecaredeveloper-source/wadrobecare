@@ -1,16 +1,16 @@
 import { defineConfig } from "vite";
 import vinext from "vinext";
 import { cloudflare } from "@cloudflare/vite-plugin";
-import { responseStoreServiceBinding } from "./cloudflare.config";
-import { responseStoreAdapter } from "@vinext/cloudflare/cache/response-store-adapter";
 
 export default defineConfig({
   plugins: [
-    vinext({
-      cache: responseStoreAdapter(),
-    }),
+    // Switched from response-store (which required an R2 bucket) to
+    // workers-cache — uses the built-in Workers Cache API, needs no R2
+    // bucket, no Durable Objects, no auxiliary Worker. Trade-off: the
+    // Response Store has better cache invalidation semantics via
+    // revalidateTag; workers-cache is simpler and works without setup.
+    vinext(),
     cloudflare({
-      auxiliaryWorkers: [{ config: responseStoreServiceBinding }],
       viteEnvironment: {
         name: "rsc",
         childEnvironments: ["ssr"],

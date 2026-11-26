@@ -84,9 +84,6 @@ jobs:
           echo "::error::Then add the printed id as a GitHub secret named HYPERDRIVE_ID."
           exit 1
 
-      - name: Deploy Response Store Worker (auxiliary cache)
-        run: npm run deploy:response-store
-
       - name: Deploy Wardrobecare Worker (main app)
         run: npm run deploy:vinext
 
