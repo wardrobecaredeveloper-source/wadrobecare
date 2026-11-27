@@ -1,5 +1,20 @@
 import { NextAuthOptions } from 'next-auth'
-import CredentialsProvider from 'next-auth/providers/credentials'
+import * as CredentialsProviderModule from 'next-auth/providers/credentials'
+
+// Workaround for a Rolldown CJS-to-ESM interop bug on Cloudflare Workers.
+// next-auth/providers/credentials is a CJS module with:
+//   Object.defineProperty(exports, "__esModule", { value: true })
+//   exports.default = Credentials
+// Rolldown's __esm() helper, when invoked with the `, 1` flag for this
+// module, wraps the WHOLE module as the default export instead of using
+// module.default. So the actual Credentials function lives at
+// credMod.default.default, not credMod.default. The defensive check
+// below handles both the broken and future-fixed interop.
+const CredentialsProvider = (
+  typeof (CredentialsProviderModule as any).default === 'function'
+    ? (CredentialsProviderModule as any).default
+    : (CredentialsProviderModule as any).default?.default
+) as typeof import('next-auth/providers/credentials').default
 import { PrismaAdapter } from '@next-auth/prisma-adapter'
 import bcrypt from 'bcryptjs'
 import { db } from '@/lib/db'
